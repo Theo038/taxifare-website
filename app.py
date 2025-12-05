@@ -13,13 +13,25 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="NY Taxi App", page_icon="🚕", layout="wide")
 
 # Hide Streamlit toolbar / "Manage app" badge / footer decorations
-st.markdown("""
-<style>
-/* Hide the Streamlit main toolbar (top-right) and bottom decoration/badge */
-div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }        /* top toolbar */
-div[data-testid="stDecoration"] { visibility: hidden; height: 0px; }     /* bottom decoration */
-div[data-testid="stStatusWidget"] { visibility: hidden; height: 0px; }   /* status widget */
-.stAppDeployButton { display:none !important; }                           /* deploy/manage. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>', unsafe_allow_html=True).stAppDeployButton { display:none !important; }                           /* deploy/manage button */
+st.markdown(
+    """
+    <style>
+    /* Hide the Streamlit main toolbar (top-right) and bottom decoration/badge */
+    div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
+    div[data-testid="stDecoration"] { visibility: hidden; height: 0px; }
+    div[data-testid="stStatusWidget"] { visibility: hidden; height: 0px; }
+    .stAppDeployButton { display:none !important; }
+    footer { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<h2>🚕 NY Taxi App Routing</h2>', unsafe_allow_html=True)
+st.markdown(
+    '<div>Type coordinates or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>',
+    unsafe_allow_html=True,
+)
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # =========================
@@ -173,7 +185,6 @@ def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     resp.raise_for_status()
 
     data = resp.json()
-    # OSRM response format and options documented in Project OSRM's API docs. [1](https://www.freeonlinecalc.com/air-quality-index-aqi-calculation-review-and-formulas.html)
     if data.get("code") != "Ok" or not data.get("routes"):
         raise RuntimeError(f"Invalid OSRM response: {data}")
 
@@ -214,9 +225,86 @@ def call_fare_api(url, params):
 # =========================
 # PREDICTION / DISPLAY
 # =========================
+if predict_now:
+    # validations
+    errs = []
+    for name, pt in [("Pickup", st.session_state.pickup), ("Dropoff", st.session_state.dropoff)]:
+        if not (-90 <= pt["lat"] <= 90 and -180 <= pt["lng"] <= 180):
+            errs.append(f"{name}: coordinates out of bounds.")
+    if passenger_count < 1:
+        errs.append("Passengers must be ≥ 1.")
 
-footer { visibility: hidden; }                                            /* default footer */
-</style>
-""", unsafe_allow_html=True)
+    if errs:
+        for e in errs: st.error(e)
+    else:
+        # OSRM route
+        with st.spinner("Routing via OSRM…"):
+            try:
+                dist_km, dur_min, path_latlon = call_osrm_route(
+                    OSRM_SERVER, PROFILE,
+                    st.session_state.pickup["lat"], st.session_state.pickup["lng"],
+                    st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]
+                )
+            except Exception as e:
+                st.error(f"OSRM error: {e}")
+                # Fallback straight-line approx if OSRM fails
+                dist_km = math.dist(
+                    (st.session_state.pickup["lat"], st.session_state.pickup["lng"]),
+                    (st.session_state.dropoff["lat"], st.session_state.dropoff["lng"])
+                ) * 111  # rough lat/lon -> km
+                dur_min = dist_km / (22/60)  # ~22 km/h
+                path_latlon = [
+                    [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
+                    [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
+                ]
 
-st.markdown('<h2>🚕 NY Taxi App Routing</h2>', unsafe_allow_html=True)
+        # Metrics
+        local_est = local_fare_estimate(dist_km, passengers=passenger_count)
+        st.markdown("### 📊 Trip details")
+        c_m1, c_m2, c_m3 = st.columns(3)
+        c_m1.metric("Distance (OSRM)", f"{dist_km:.2f} km")
+        c_m2.metric("Duration (OSRM)", f"{int(dur_min)} min")
+        c_m3.metric("Local estimate", f"${local_est:.2f}")
+
+        # Route map
+        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB positron")
+        folium.Marker(
+            [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
+            popup="Pickup",
+            icon=folium.Icon(color="green", icon="play")
+        ).add_to(m2)
+        folium.Marker(
+            [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
+            popup="Dropoff",
+            icon=folium.Icon(color="red", icon="flag")
+        ).add_to(m2)
+        folium.PolyLine(
+            locations=path_latlon,
+            color="#2A9D8F", weight=6, opacity=0.95
+        ).add_to(m2)
+        try:
+            m2.fit_bounds(path_latlon)
+        except Exception:
+            pass
+        st_folium(m2, height=540, width=820, key="uber_map_osrm_result", returned_objects=[])
+
+        # Fare API
+        with st.spinner("Calling fare API…"):
+            try:
+                payload = make_payload(st.session_state.pickup, st.session_state.dropoff, trip_date, trip_time, passenger_count)
+                result = call_fare_api(fare_api_url, payload)
+                fare = result.get("fare") or result.get("prediction") or result.get("y_pred")
+                if fare is not None:
+                    st.success("Prediction received (API)")
+                    st.metric("💵 Estimated fare (API)", f"${float(fare):.2f}")
+                else:
+                    st.warning("API returned JSON but no 'fare' key — showing local estimate.")
+                with st.expander("📦 Request details"):
+                    st.json({"endpoint": fare_api_url, "params": payload})
+                with st.expander("📬 Raw API response"):
+                    st.json(result)
+            except Exception as e:
+                st.error(f"Fare API error: {e}")
+                st.info(f"Local fallback fare: **${local_est:.2f}**")
+
+st.caption("Built with Streamlit • Folium • streamlit-folium • Requests • OSRM — Real route, distance & duration.")
