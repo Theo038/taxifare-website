@@ -13,14 +13,14 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="Uber-like Taxi App (OSRM)", page_icon="🚕", layout="wide")
 st.markdown("""
 <style>
-.big-title {font-size:2.1rem;font-weight:800;margin-bottom:0.2rem}
+.big-title {font-size:2.0rem;font-weight:800;margin-bottom:0.2rem}
 .subtle {color:#6b7280}
 .stButton>button {height:2.8rem;font-size:1rem;border-radius:10px}
 .metric-row {display:flex;gap:1rem}
 </style>
 """, unsafe_allow_html=True)
 st.markdown('<div class="big-title">🚕 Uber-like — OSRM Routing</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">Click the map to set Pickup/Dropoff, then press “Request a driver”.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">Type coordinates or click the map. The nearest marker (pickup/dropoff) moves to your click.</div>', unsafe_allow_html=True)
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # =========================
@@ -30,11 +30,10 @@ OSRM_SERVER = "https://router.project-osrm.org"  # demo server (for testing)
 PROFILE = "driving"                               # always driving
 DEFAULT_FARE_API = "https://taxifare.lewagon.ai/predict"
 
-# You can override the fare API via the sidebar if you want
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     fare_api_url = st.text_input("Fare prediction endpoint (GET)", value=DEFAULT_FARE_API)
-    st.info("OSRM demo server is rate-limited and provides no SLA. Avoid spamming; 429 may occur.")
+    st.info("OSRM demo server is rate-limited (429 possible) and provides no SLA. Avoid spamming.")
 
 # =========================
 # SESSION STATE
@@ -47,8 +46,6 @@ def init_state():
     if "dropoff" not in st.session_state:
         # Central Park South
         st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}
-    if "map_mode" not in st.session_state:
-        st.session_state.map_mode = "Pickup"
     if "last_click" not in st.session_state:
         st.session_state.last_click = None
 
@@ -65,14 +62,13 @@ with left:
     trip_date = c_dt1.date_input("Date", value=datetime.now().date())
     trip_time = c_dt2.time_input("Time", value=time(12, 0))
 
-    st.session_state.map_mode = st.radio("Map click mode", ["Pickup", "Dropoff"], horizontal=True)
-
     st.markdown("#### 📍 Pickup")
     p1, p2 = st.columns(2)
     pickup_lat = p1.number_input("Pickup latitude", value=float(st.session_state.pickup["lat"]), format="%.6f")
     pickup_lng = p2.number_input("Pickup longitude", value=float(st.session_state.pickup["lng"]), format="%.6f")
     if st.button("🔄 Update map from pickup"):
         st.session_state.pickup = {"lat": float(pickup_lat), "lng": float(pickup_lng)}
+        st.rerun()
 
     st.markdown("#### 🏁 Dropoff")
     d1, d2 = st.columns(2)
@@ -80,6 +76,7 @@ with left:
     dropoff_lng = d2.number_input("Dropoff longitude", value=float(st.session_state.dropoff["lng"]), format="%.6f")
     if st.button("🔄 Update map from dropoff"):
         st.session_state.dropoff = {"lat": float(dropoff_lat), "lng": float(dropoff_lng)}
+        st.rerun()
 
     passenger_count = st.slider("👥 Passengers", min_value=1, max_value=6, value=1)
 
@@ -100,8 +97,9 @@ with right:
     center_lat = (st.session_state.pickup["lat"] + st.session_state.dropoff["lat"]) / 2
     center_lng = (st.session_state.pickup["lng"] + st.session_state.dropoff["lng"]) / 2
 
-    # Fancy dark basemap
-    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB Dark_Matter")
+    # Pretty non-black basemap (choose one)
+    # m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB Positron")  # clean light
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="Stamen Terrain")     # colorful terrain
 
     # Markers
     folium.Marker(
@@ -127,14 +125,17 @@ with right:
     # Render + capture clicks
     map_data = st_folium(m, height=540, width=820, key="uber_map_nyc", returned_objects=[])
 
-    # Click handler (robust, with st.rerun)
+    # Click handler: move the nearest marker (pickup or dropoff) to the clicked point
     if map_data and ("last_clicked" in map_data) and map_data["last_clicked"]:
         click_lat = float(map_data["last_clicked"]["lat"])
         click_lng = float(map_data["last_clicked"]["lng"])
         last = st.session_state.last_click
         if last is None or (abs(last[0]-click_lat) > 1e-10 or abs(last[1]-click_lng) > 1e-10):
             st.session_state.last_click = (click_lat, click_lng)
-            if st.session_state.map_mode == "Pickup":
+            # Compute distances to each marker (in degrees approximate; fine for choosing nearest)
+            d_pick = math.hypot(click_lat - st.session_state.pickup["lat"], click_lng - st.session_state.pickup["lng"])
+            d_drop = math.hypot(click_lat - st.session_state.dropoff["lat"], click_lng - st.session_state.dropoff["lng"])
+            if d_pick <= d_drop:
                 st.session_state.pickup = {"lat": click_lat, "lng": click_lng}
             else:
                 st.session_state.dropoff = {"lat": click_lat, "lng": click_lng}
@@ -149,7 +150,7 @@ def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     Call OSRM /route and return: distance_km, duration_min, path_latlon
 
     - OSRM expects coordinates {lon},{lat} in the URL
-    - We request geometries=geojson (easier than decoding polyline)
+    - Request geometries=geojson (easier than decoding polyline)
     - OSRM returns GeoJSON coordinates in [lon,lat]; for Folium/Leaflet we swap to [lat,lon]
     """
     coords = f"{p_lng},{p_lat};{d_lng},{d_lat}"
@@ -250,7 +251,7 @@ if predict_now:
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Route map (WOW effect)
-        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB Dark_Matter")
+        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="Stamen Terrain")
         folium.Marker(
             [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
             popup="Pickup",
@@ -263,9 +264,8 @@ if predict_now:
         ).add_to(m2)
         folium.PolyLine(
             locations=path_latlon,
-            color="#00E5FF", weight=6, opacity=0.95
+            color="#2A9D8F", weight=6, opacity=0.95
         ).add_to(m2)
-        # Zoom to route bounds
         try:
             m2.fit_bounds(path_latlon)
         except Exception:
