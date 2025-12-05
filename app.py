@@ -1,5 +1,24 @@
 
 # app.py
+# Streamlit NY Taxi App — Address Autocomplete + OSRM Routing
+# -----------------------------------------------------------
+# Features:
+#   • Live address AUTOCOMPLETE (Mapbox v6 preferred, LocationIQ fallback)
+#   • Map click-to-move: the NEAREST marker (pickup/dropoff) moves to your click
+#   • OSRM routing (driving): real road geometry, distance & duration
+#   • Clean light basemap (CartoDB positron)
+#   • Hidden Streamlit toolbar/badge per styling
+#
+# Provider docs:
+#   • Mapbox Geocoding v6 (forward, autocomplete, proximity, bbox):
+#       https://docs.mapbox.com/api/search/geocoding-v6/       # ← API reference
+#       https://docs.mapbox.com/playground/geocoding/          # ← Playground
+#   • LocationIQ Autocomplete:
+#       https://docs.locationiq.com/docs/autocomplete          # ← Overview/usage
+#       https://docs.locationiq.com/reference/autocomplete-2   # ← API reference
+#   • OSRM Route API (geometries=geojson, overview=full):
+#       http://project-osrm.org/docs/v5.5.1/api/               # ← API docs
+
 import os
 import time
 import math
@@ -18,17 +37,17 @@ st.set_page_config(page_title="NY Taxi App — Autocomplete + OSRM", page_icon="
 st.markdown(
     """
     <style>
-    div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
-    div[data-testid="stDecoration"] { visibility: hidden; height: 0px; }
-    div[data-testid="stStatusWidget"] { visibility: hidden; height: 0px; }
-    .stAppDeployButton { display:none !important; }
-    footer { visibility: hidden; }
+    div[data-testid="st    footer { visibility: hidden; }    div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown('<h2>🚕 NY Taxi App — Address Autocomplete + OSRM Routingdiv>', unsafe_allow_html=True)st.markdown('<h2>🚕 NY Taxi App — Address Autocomplete + OSRM Routing</h2>', unsafe_allow_html=True)
+st.markdown('<h2>🚕 NY Taxi App — Address Autocomplete + OSRM Routing</h2>', unsafe_allow_html=True)
+st.markdown(
+    '<div>Type addresses or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>',
+    unsafe_allow_html=True,
+)
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # =========================
@@ -38,7 +57,7 @@ OSRM_SERVER = "https://router.project-osrm.org"        # demo server
 PROFILE = "driving"                                     # fixed
 DEFAULT_FARE_API = "https://taxifare.lewagon.ai/predict"
 NYC_VIEWBOX = (-74.259, 40.477, -73.700, 40.917)        # lon/lat bbox NYC
-NYC_CENTER = (-73.9855, 40.7580)                        # (lon, lat)
+NYC_CENTER = (-73.9855, 40.7580)                        # (lon, lat) Times Sq proximity
 
 # Autocomplete providers (set tokens via environment)
 MAPBOX_ACCESS_TOKEN = os.getenv("MAPBOX_ACCESS_TOKEN")          # preferred for autocomplete (v6)
@@ -89,7 +108,7 @@ init_state()
 # PROVIDERS — Autocomplete (Mapbox, LocationIQ)
 # =========================
 def autocomplete_mapbox(q: str, limit=6, bbox=NYC_VIEWBOX, proximity=NYC_CENTER):
-    """Mapbox Geocoding v6 forward with autocomplete."""
+    """Mapbox Geocoding v6 forward with autocomplete (docs: geocoding v6)."""
     if not MAPBOX_ACCESS_TOKEN:
         return []
     url = "https://api.mapbox.com/search/geocode/v6/forward"
@@ -117,7 +136,7 @@ def autocomplete_mapbox(q: str, limit=6, bbox=NYC_VIEWBOX, proximity=NYC_CENTER)
     return out
 
 def autocomplete_locationiq(q: str, limit=6, countrycodes="us", viewbox=NYC_VIEWBOX, bounded=1):
-    """LocationIQ Autocomplete endpoint."""
+    """LocationIQ Autocomplete endpoint (docs)."""
     if not LOCATIONIQ_TOKEN:
         return []
     url = "https://api.locationiq.com/v1/autocomplete"
@@ -141,28 +160,28 @@ def autocomplete_locationiq(q: str, limit=6, countrycodes="us", viewbox=NYC_VIEW
     return out
 
 def get_suggestions(q: str, is_pickup: bool):
-    """Fetch suggestions using available provider (Mapbox preferred, else LocationIQ). Throttle calls."""
+    """
+    Fetch suggestions using available provider (Mapbox preferred, else LocationIQ).
+    Throttle calls to ~0.6s between keystrokes.
+    """
     now = time.time()
-    # throttle per-field
     last_key = "pickup_last_autocomplete" if is_pickup else "dropoff_last_autocomplete"
     if now - st.session_state[last_key] < 0.6:
         return
     st.session_state[last_key] = now
 
+    suggestions = []
     if MAPBOX_ACCESS_TOKEN:
         try:
             suggestions = autocomplete_mapbox(q)
         except Exception as e:
-            suggestions = []
             st.warning(f"Autocomplete error (Mapbox): {e}")
     elif LOCATIONIQ_TOKEN:
         try:
             suggestions = autocomplete_locationiq(q)
         except Exception as e:
-            suggestions = []
             st.warning(f"Autocomplete error (LocationIQ): {e}")
     else:
-        suggestions = []
         st.info("No autocomplete provider configured. Set MAPBOX_ACCESS_TOKEN or LOCATIONIQ_TOKEN.")
 
     if is_pickup:
@@ -305,6 +324,10 @@ with right:
 # =========================
 @st.cache_data(show_spinner=False, ttl=300)
 def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
+    """
+    Call OSRM /route and return: distance_km, duration_min, path_latlon.
+    (Docs: OSRM HTTP API — geometries=geojson, overview=full)
+    """
     coords = f"{p_lng},{p_lat};{d_lng},{d_lat}"
     url = f"{server}/route/v1/{profile}/{coords}"
     params = {"geometries": "geojson", "overview": "full"}
@@ -419,5 +442,4 @@ if predict_now:
             except Exception as e:
                 st.error(f"Fare API error: {e}")
                 st.info(f"Local fallback fare: **${local_est:.2f}**")
-
 
