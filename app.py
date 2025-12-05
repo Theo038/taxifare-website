@@ -10,23 +10,22 @@ from streamlit_folium import st_folium
 # =========================
 # PAGE CONFIG + STYLE
 # =========================
-st.set_page_config(page_title="Uber-like Taxi App (OSRM)", page_icon="🚕", layout="wide")
+st.set_page_config(page_title="NY Taxi App", page_icon="🚕", layout="wide")
+
+# Hide Streamlit toolbar / "Manage app" badge / footer decorations
 st.markdown("""
 <style>
-.big-title {font-size:2.0rem;font-weight:800;margin-bottom:0.2rem}
-.subtle {color:#6b7280}
-.stButton>button {height:2.8rem;font-size:1rem;border-radius:10px}
-.metric-row {display:flex;gap:1rem}
-</style>
-""", unsafe_allow_html=True)
-st.markdown('<div class="big-title">🚕 Uber-like — OSRM Routing</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">Type coordinates or click the map. The nearest marker (pickup/dropoff) moves to your click.</div>', unsafe_allow_html=True)
+/* Hide the Streamlit main toolbar (top-right) and bottom decoration/badge */
+div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }        /* top toolbar */
+div[data-testid="stDecoration"] { visibility: hidden; height: 0px; }     /* bottom decoration */
+div[data-testid="stStatusWidget"] { visibility: hidden; height: 0px; }   /* status widget */
+.stAppDeployButton { display:none !important; }                           /* deploy/manage. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>', unsafe_allow_html=True).stAppDeployButton { display:none !important; }                           /* deploy/manage button */
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # =========================
 # CONSTANTS (fixed OSRM profile & endpoints)
 # =========================
-OSRM_SERVER = "https://router.project-osrm.org"  # demo server (for testing)
+OSRM_SERVER = "https://router.project-osrm.org"   # demo server (testing)
 PROFILE = "driving"                               # always driving
 DEFAULT_FARE_API = "https://taxifare.lewagon.ai/predict"
 
@@ -93,12 +92,11 @@ with left:
         st.rerun()
 
 with right:
-    st.markdown("### 🗺️ Interactive map (OSRM)")
+    st.markdown("### 🗺️ Interactive map")
     center_lat = (st.session_state.pickup["lat"] + st.session_state.dropoff["lat"]) / 2
     center_lng = (st.session_state.pickup["lng"] + st.session_state.dropoff["lng"]) / 2
 
-    # Pretty non-black basemap (choose one)
-    # m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB Positron")  # clean light
+    # Pretty light basemap (reliable alias; no attribution error)
     m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
 
     # Markers
@@ -122,24 +120,35 @@ with right:
         color="#bbb", weight=2, opacity=0.5
     ).add_to(m)
 
-    # Render + capture clicks
-    map_data = st_folium(m, height=540, width=820, key="uber_map_nyc", returned_objects=[])
+    # Render + capture clicks (defensive access to the click structure)
+    map_data = st_folium(
+        m, height=540, width=820,
+        key="uber_map_nyc",
+        returned_objects=[]
+    )
 
-    # Click handler: move the nearest marker (pickup or dropoff) to the clicked point
-    if map_data and ("last_clicked" in map_data) and map_data["last_clicked"]:
-        click_lat = float(map_data["last_clicked"]["lat"])
-        click_lng = float(map_data["last_clicked"]["lng"])
-        last = st.session_state.last_click
-        if last is None or (abs(last[0]-click_lat) > 1e-10 or abs(last[1]-click_lng) > 1e-10):
-            st.session_state.last_click = (click_lat, click_lng)
-            # Compute distances to each marker (in degrees approximate; fine for choosing nearest)
-            d_pick = math.hypot(click_lat - st.session_state.pickup["lat"], click_lng - st.session_state.pickup["lng"])
-            d_drop = math.hypot(click_lat - st.session_state.dropoff["lat"], click_lng - st.session_state.dropoff["lng"])
-            if d_pick <= d_drop:
-                st.session_state.pickup = {"lat": click_lat, "lng": click_lng}
-            else:
-                st.session_state.dropoff = {"lat": click_lat, "lng": click_lng}
-            st.rerun()
+    # --- Robust click handler: move the nearest marker to the clicked point ---
+    click = (map_data or {}).get("last_clicked")
+    if click:
+        try:
+            click_lat = float(click.get("lat"))
+            click_lng = float(click.get("lng"))
+        except (TypeError, ValueError):
+            click_lat = click_lng = None
+
+        if click_lat is not None and click_lng is not None:
+            last = st.session_state.last_click
+            # Only react if the click changed
+            if last is None or (abs(last[0] - click_lat) > 1e-10 or abs(last[1] - click_lng) > 1e-10):
+                st.session_state.last_click = (click_lat, click_lng)
+                # Move the NEAREST marker (intuitive, no mode buttons)
+                d_pick = math.hypot(click_lat - st.session_state.pickup["lat"], click_lng - st.session_state.pickup["lng"])
+                d_drop = math.hypot(click_lat - st.session_state.dropoff["lat"], click_lng - st.session_state.dropoff["lng"])
+                if d_pick <= d_drop:
+                    st.session_state.pickup = {"lat": click_lat, "lng": click_lng}
+                else:
+                    st.session_state.dropoff = {"lat": click_lat, "lng": click_lng}
+                st.rerun()
 
 # =========================
 # HELPERS & OSRM
@@ -149,16 +158,13 @@ def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     """
     Call OSRM /route and return: distance_km, duration_min, path_latlon
 
-    - OSRM expects coordinates {lon},{lat} in the URL
-    - Request geometries=geojson (easier than decoding polyline)
-    - OSRM returns GeoJSON coordinates in [lon,lat]; for Folium/Leaflet we swap to [lat,lon]
+    OSRM expects coordinates {lon},{lat} in the URL.
+    Request geometries=geojson (easier than decoding polyline).
+    OSRM returns GeoJSON coordinates in [lon,lat]; swap to [lat,lon] for Folium/Leaflet.
     """
     coords = f"{p_lng},{p_lat};{d_lng},{d_lat}"
     url = f"{server}/route/v1/{profile}/{coords}"
-    params = {
-        "geometries": "geojson",
-        "overview": "full"
-    }
+    params = {"geometries": "geojson", "overview": "full"}
     headers = {"User-Agent": "streamlit-uber-osrm-demo"}
     resp = requests.get(url, params=params, headers=headers, timeout=20)
 
@@ -167,6 +173,7 @@ def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     resp.raise_for_status()
 
     data = resp.json()
+    # OSRM response format and options documented in Project OSRM's API docs. [1](https://www.freeonlinecalc.com/air-quality-index-aqi-calculation-review-and-formulas.html)
     if data.get("code") != "Ok" or not data.get("routes"):
         raise RuntimeError(f"Invalid OSRM response: {data}")
 
@@ -207,89 +214,9 @@ def call_fare_api(url, params):
 # =========================
 # PREDICTION / DISPLAY
 # =========================
-if predict_now:
-    # validations
-    errs = []
-    for name, pt in [("Pickup", st.session_state.pickup), ("Dropoff", st.session_state.dropoff)]:
-        if not (-90 <= pt["lat"] <= 90 and -180 <= pt["lng"] <= 180):
-            errs.append(f"{name}: coordinates out of bounds.")
-    if passenger_count < 1:
-        errs.append("Passengers must be ≥ 1.")
 
-    if errs:
-        for e in errs: st.error(e)
-    else:
-        # OSRM route
-        with st.spinner("Routing via OSRM…"):
-            try:
-                dist_km, dur_min, path_latlon = call_osrm_route(
-                    OSRM_SERVER, PROFILE,
-                    st.session_state.pickup["lat"], st.session_state.pickup["lng"],
-                    st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]
-                )
-            except Exception as e:
-                st.error(f"OSRM error: {e}")
-                # Fallback straight-line approx if OSRM fails
-                dist_km = math.dist(
-                    (st.session_state.pickup["lat"], st.session_state.pickup["lng"]),
-                    (st.session_state.dropoff["lat"], st.session_state.dropoff["lng"])
-                ) * 111  # rough lat/lon -> km
-                dur_min = dist_km / (22/60)  # ~22 km/h
-                path_latlon = [
-                    [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-                    [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-                ]
+footer { visibility: hidden; }                                            /* default footer */
+</style>
+""", unsafe_allow_html=True)
 
-        # Metrics
-        local_est = local_fare_estimate(dist_km, passengers=passenger_count)
-        st.markdown("### 📊 Trip details")
-        st.markdown('<div class="metric-row">', unsafe_allow_html=True)
-        c_m1, c_m2, c_m3 = st.columns(3)
-        c_m1.metric("Distance (OSRM)", f"{dist_km:.2f} km")
-        c_m2.metric("Duration (OSRM)", f"{int(dur_min)} min")
-        c_m3.metric("Local estimate", f"${local_est:.2f}")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        # Route map (WOW effect)
-        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB positron")
-        folium.Marker(
-            [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-            popup="Pickup",
-            icon=folium.Icon(color="green", icon="play")
-        ).add_to(m2)
-        folium.Marker(
-            [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-            popup="Dropoff",
-            icon=folium.Icon(color="red", icon="flag")
-        ).add_to(m2)
-        folium.PolyLine(
-            locations=path_latlon,
-            color="#2A9D8F", weight=6, opacity=0.95
-        ).add_to(m2)
-        try:
-            m2.fit_bounds(path_latlon)
-        except Exception:
-            pass
-        st_folium(m2, height=540, width=820, key="uber_map_osrm_result", returned_objects=[])
-
-        # Fare API
-        with st.spinner("Calling fare API…"):
-            try:
-                payload = make_payload(st.session_state.pickup, st.session_state.dropoff, trip_date, trip_time, passenger_count)
-                result = call_fare_api(fare_api_url, payload)
-                fare = result.get("fare") or result.get("prediction") or result.get("y_pred")
-                if fare is not None:
-                    st.success("Prediction received (API)")
-                    st.metric("💵 Estimated fare (API)", f"${float(fare):.2f}")
-                else:
-                    st.warning("API returned JSON but no 'fare' key — showing local estimate.")
-                with st.expander("📦 Request details"):
-                    st.json({"endpoint": fare_api_url, "params": payload})
-                with st.expander("📬 Raw API response"):
-                    st.json(result)
-            except Exception as e:
-                st.error(f"Fare API error: {e}")
-                st.info(f"Local fallback fare: **${local_est:.2f}**")
-
-st.markdown("<hr>", unsafe_allow_html=True)
-st.caption("Built with Streamlit • Folium • streamlit-folium • Requests • OSRM — Real route, distance & duration.")
+st.markdown('<h2>🚕 NY Taxi App Routing</h2>', unsafe_allow_html=True)
