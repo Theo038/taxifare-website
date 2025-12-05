@@ -99,7 +99,7 @@ with right:
 
     # Pretty non-black basemap (choose one)
     # m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB Positron")  # clean light
-    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="Stamen Terrain")     # colorful terrain
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="OpenStreetMap")
 
     # Markers
     folium.Marker(
