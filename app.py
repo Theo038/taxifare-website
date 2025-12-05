@@ -99,7 +99,7 @@ with right:
 
     # Pretty non-black basemap (choose one)
     # m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB Positron")  # clean light
-    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="OpenStreetMap")
+    m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
 
     # Markers
     folium.Marker(
@@ -251,7 +251,7 @@ if predict_now:
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Route map (WOW effect)
-        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="OpenStreetMap")
+        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB positron")
         folium.Marker(
             [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
             popup="Pickup",
