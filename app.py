@@ -251,7 +251,7 @@ if predict_now:
         st.markdown('</div>', unsafe_allow_html=True)
 
         # Route map (WOW effect)
-        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="Stamen Terrain")
+        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="OpenStreetMap")
         folium.Marker(
             [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
             popup="Pickup",
