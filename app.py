@@ -1,9 +1,10 @@
-
 # app.py
+import os
+import time
 import math
 import requests
 import streamlit as st
-from datetime import datetime, time
+from datetime import datetime, time as tm
 import folium
 from streamlit_folium import st_folium
 
@@ -26,9 +27,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<h2>🚕 NY Taxi App Routing</h2>', unsafe_allow_html=True)
+st.markdown('<h2>🚕 NY Taxi App — Autocomplete + OSRM Routing</h2>', unsafe_allow_html=True)
 st.markdown(
-    '<div>Type address or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>',
+    '<div>Type addresses or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click. '
+    'With a <b>LocationIQ</b> token, you’ll get live <b>autocomplete</b>.</div>',
     unsafe_allow_html=True,
 )
 st.markdown("<hr>", unsafe_allow_html=True)
@@ -36,14 +38,19 @@ st.markdown("<hr>", unsafe_allow_html=True)
 # =========================
 # CONSTANTS (OSRM & Fare API)
 # =========================
-OSRM_SERVER = "https://router.project-osrm.org"          # demo server
-PROFILE = "driving"                                      # fixed
+OSRM_SERVER = "https://router.project-osrm.org"      # demo server
+PROFILE = "driving"                                   # fixed profile
 DEFAULT_FARE_API = "https://taxifare.lewagon.ai/predict"
+NYC_VIEWBOX = (-74.259, 40.477, -73.700, 40.917)      # lon/lat bbox NYC
+LOCATIONIQ_TOKEN = os.getenv("LOCATIONIQ_TOKEN")      # set this for live autocomplete
 
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     fare_api_url = st.text_input("Fare prediction endpoint (GET)", value=DEFAULT_FARE_API)
-    st.info("OSRM demo server is rate-limited (429 possible). Avoid spamming.")
+    if LOCATIONIQ_TOKEN:
+        st.success("LocationIQ token detected — live autocomplete enabled.")
+    else:
+        st.info("No LocationIQ token — use 'Search suggestions' button for compliant Nominatim lookups.")
 
 # =========================
 # SESSION STATE
@@ -54,99 +61,171 @@ def init_state():
         st.session_state.pickup = {"lat": 40.7580, "lng": -73.9855}   # Times Square
     if "dropoff" not in st.session_state:
         st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}  # Central Park South
-    if "last_click" not in st.session_state:
-        st.session_state.last_click = None
     if "pickup_address" not in st.session_state:
         st.session_state.pickup_address = "Times Square, New York, NY"
     if "dropoff_address" not in st.session_state:
         st.session_state.dropoff_address = "Central Park South, New York, NY"
+    if "last_click" not in st.session_state:
+        st.session_state.last_click = None
+    # Autocomplete state
+    if "pickup_query" not in st.session_state:
+        st.session_state.pickup_query = st.session_state.pickup_address
+    if "dropoff_query" not in st.session_state:
+        st.session_state.dropoff_query = st.session_state.dropoff_address
+    if "pickup_suggestions" not in st.session_state:
+        st.session_state.pickup_suggestions = []
+    if "dropoff_suggestions" not in st.session_state:
+        st.session_state.dropoff_suggestions = []
+    if "last_autocomplete_time" not in st.session_state:
+        st.session_state.last_autocomplete_time = 0.0
 
 init_state()
 
 # =========================
-# GEOCODING (Nominatim)
+# PROVIDERS — Autocomplete & Geocoding
 # =========================
 @st.cache_data(ttl=600, show_spinner=False)
-def geocode_address(q: str, countrycodes="us"):
+def autocomplete_locationiq(q: str, limit=6, countrycodes="us", viewbox=NYC_VIEWBOX, bounded=1):
     """
-    Geocode using Nominatim Search API (jsonv2).
-    Respect usage policy: provide User-Agent, keep <=1 req/s, cache results.  (docs)  [1](https://nominatim.org/release-docs/latest/api/Search/)[2](https://operations.osmfoundation.org/policies/nominatim/)
+    LocationIQ Autocomplete (type-ahead, supports substrings).
+    https://api.locationiq.com/v1/autocomplete?key=TOKEN&q=SEARCH  (docs)
+    """
+    if not LOCATIONIQ_TOKEN:
+        return []
+    url = "https://api.locationiq.com/v1/autocomplete"
+    params = {
+        "key": LOCATIONIQ_TOKEN,
+        "q": q,
+        "limit": limit,
+        "countrycodes": countrycodes,
+        "viewbox": f"{viewbox[0]},{viewbox[1]},{viewbox[2]},{viewbox[3]}",
+        "bounded": bounded,
+        "accept-language": "en"
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    out = []
+    for item in data:
+        label = item.get("display_name") or item.get("address", "")
+        lat = float(item.get("lat"))
+        lng = float(item.get("lon"))
+        out.append({"label": label, "lat": lat, "lng": lng})
+    return out
+
+@st.cache_data(ttl=600, show_spinner=False)
+def search_nominatim(q: str, limit=5, countrycodes="us", viewbox=NYC_VIEWBOX, bounded=1):
+    """
+    Nominatim Search (manual suggestions). Compliant: no per-keystroke autocomplete on public server.
+    https://nominatim.openstreetmap.org/search?format=jsonv2&...  (docs/policy)
     """
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "q": q,
         "format": "jsonv2",
-        "limit": 1,
+        "limit": limit,
         "countrycodes": countrycodes,
+        "viewbox": f"{viewbox[0]},{viewbox[1]},{viewbox[2]},{viewbox[3]}",
+        "bounded": bounded,
+        "accept-language": "en"
     }
-    headers = {
-        # Identify your app per policy; put a contact email/URL if you deploy publicly.
-        "User-Agent": "ny-taxi-app/1.0 (contact: user@example.com)"
-    }
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
-    if resp.status_code == 429:
-        raise RuntimeError("Nominatim rate limit (429). Please slow down.")
+    headers = {"User-Agent": "ny-taxi-app/1.0 (contact: user@example.com)"}
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    if not data:
-        return None
-    item = data[0]
-    return {
-        "lat": float(item["lat"]),
-        "lng": float(item["lon"]),
-        "display_name": item.get("display_name", q),
-    }
+    out = []
+    for item in data:
+        label = item.get("display_name", q)
+        lat = float(item["lat"]); lng = float(item["lon"])
+        out.append({"label": label, "lat": lat, "lng": lng})
+    return out
 
 # =========================
-# UI CONTROLS
+# UI — Addresses with Autocomplete
 # =========================
-left, right = st.columns([0.42, 0.58])
+left, right = st.columns([0.48, 0.52])
 
 with left:
     st.markdown("### 🎛️ Trip parameters")
     c_dt1, c_dt2 = st.columns(2)
     trip_date = c_dt1.date_input("Date", value=datetime.now().date())
-    trip_time = c_dt2.time_input("Time", value=time(12, 0))
+    trip_time = c_dt2.time_input("Time", value=tm(12, 0))
 
-    # --- Address inputs + Geocode buttons ---
-    st.markdown("#### 📍 Pickup address")
-    col_pa1, col_pa2 = st.columns([3, 1])
-    st.session_state.pickup_address = col_pa1.text_input(
-        "Enter pickup address",
-        value=st.session_state.pickup_address,
+    # --- Pickup autocomplete ---
+    st.markdown("#### 📍 Pickup")
+    st.session_state.pickup_query = st.text_input(
+        "Pickup address",
+        value=st.session_state.pickup_query,
         placeholder="e.g., 1600 Broadway, New York, NY",
+        key="pickup_query_input",
     )
-    if col_pa2.button("🔎 Geocode pickup"):
-        try:
-            res = geocode_address(st.session_state.pickup_address)
-            if res is None:
-                st.warning("No result for pickup address.")
-            else:
-                st.session_state.pickup = {"lat": res["lat"], "lng": res["lng"]}
-                # overwrite normalized display name
-                st.session_state.pickup_address = res["display_name"]
-                st.rerun()
-        except Exception as e:
-            st.error(f"Pickup geocoding failed: {e}")
 
-    st.markdown("#### 🏁 Dropoff address")
-    col_da1, col_da2 = st.columns([3, 1])
-    st.session_state.dropoff_address = col_da1.text_input(
-        "Enter dropoff address",
-        value=st.session_state.dropoff_address,
-        placeholder="e.g., 10 Columbus Cir, New York, NY",
-    )
-    if col_da2.button("🔎 Geocode dropoff"):
-        try:
-            res = geocode_address(st.session_state.dropoff_address)
-            if res is None:
-                st.warning("No result for dropoff address.")
-            else:
-                st.session_state.dropoff = {"lat": res["lat"], "lng": res["lng"]}
-                st.session_state.dropoff_address = res["display_name"]
+    # live suggestions if LocationIQ token is present (throttle to ~0.6s)
+    if LOCATIONIQ_TOKEN and len(st.session_state.pickup_query.strip()) >= 3:
+        now = time.time()
+        if now - st.session_state.last_autocomplete_time > 0.6:
+            try:
+                st.session_state.pickup_suggestions = autocomplete_locationiq(st.session_state.pickup_query)
+                st.session_state.last_autocomplete_time = now
+            except Exception as e:
+                st.session_state.pickup_suggestions = []
+                st.warning(f"Pickup autocomplete error: {e}")
+
+    # manual compliant search if no token
+    if not LOCATIONIQ_TOKEN:
+        if st.button("🔎 Search pickup suggestions"):
+            try:
+                st.session_state.pickup_suggestions = search_nominatim(st.session_state.pickup_query)
+            except Exception as e:
+                st.session_state.pickup_suggestions = []
+                st.error(f"Pickup search failed: {e}")
+
+    if st.session_state.pickup_suggestions:
+        labels = [s["label"] for s in st.session_state.pickup_suggestions]
+        sel = st.selectbox("Suggestions (pickup)", labels, index=0, key="pickup_suggestions_select")
+        if sel:
+            choice = next((s for s in st.session_state.pickup_suggestions if s["label"] == sel), None)
+            if choice:
+                st.session_state.pickup = {"lat": choice["lat"], "lng": choice["lng"]}
+                st.session_state.pickup_address = choice["label"]
                 st.rerun()
-        except Exception as e:
-            st.error(f"Dropoff geocoding failed: {e}")
+
+    # --- Dropoff autocomplete ---
+    st.markdown("#### 🏁 Dropoff")
+    st.session_state.dropoff_query = st.text_input(
+        "Dropoff address",
+        value=st.session_state.dropoff_query,
+        placeholder="e.g., 10 Columbus Cir, New York, NY",
+        key="dropoff_query_input",
+    )
+
+    if LOCATIONIQ_TOKEN and len(st.session_state.dropoff_query.strip()) >= 3:
+        now = time.time()
+        if now - st.session_state.last_autocomplete_time > 0.6:
+            try:
+                st.session_state.dropoff_suggestions = autocomplete_locationiq(st.session_state.dropoff_query)
+                st.session_state.last_autocomplete_time = now
+            except Exception as e:
+                st.session_state.dropoff_suggestions = []
+                st.warning(f"Dropoff autocomplete error: {e}")
+
+    if not LOCATIONIQ_TOKEN:
+        if st.button("🔎 Search dropoff suggestions"):
+            try:
+                st.session_state.dropoff_suggestions = search_nominatim(st.session_state.dropoff_query)
+            except Exception as e:
+                st.session_state.dropoff_suggestions = []
+                st.error(f"Dropoff search failed: {e}")
+
+    if st.session_state.dropoff_suggestions:
+        labels = [s["label"] for s in st.session_state.dropoff_suggestions]
+        sel = st.selectbox("Suggestions (dropoff)", labels, index=0, key="dropoff_suggestions_select")
+        if sel:
+            choice = next((s for s in st.session_state.dropoff_suggestions if s["label"] == sel), None)
+            if choice:
+                st.session_state.dropoff = {"lat": choice["lat"], "lng": choice["lng"]}
+                st.session_state.dropoff_address = choice["label"]
+                st.rerun()
 
     # Passengers
     passenger_count = st.slider("👥 Passengers", min_value=1, max_value=6, value=1)
@@ -162,204 +241,25 @@ with left:
         st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}
         st.session_state.pickup_address = "Times Square, New York, NY"
         st.session_state.dropoff_address = "Central Park South, New York, NY"
+        st.session_state.pickup_query = st.session_state.pickup_address
+        st.session_state.dropoff_query = st.session_state.dropoff_address
+        st.session_state.pickup_suggestions = []
+        st.session_state.dropoff_suggestions = []
         st.session_state.last_click = None
         st.rerun()
 
+# =========================
+# MAP + CLICK-TO-MOVE
+# =========================
 with right:
     st.markdown("### 🗺️ Interactive map")
     center_lat = (st.session_state.pickup["lat"] + st.session_state.dropoff["lat"]) / 2
     center_lng = (st.session_state.pickup["lng"] + st.session_state.dropoff["lng"]) / 2
 
-    # Light basemap (reliable alias)
     m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
 
-    # Markers with address popups
     folium.Marker(
         [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
         popup=f"Pickup:<br>{st.session_state.pickup_address}",
         icon=folium.Icon(color="green", icon="play")
     ).add_to(m)
-    folium.Marker(
-        [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-        popup=f"Dropoff:<br>{st.session_state.dropoff_address}",
-        icon=folium.Icon(color="red", icon="flag")
-    ).add_to(m)
-
-    # Straight line before OSRM route
-    folium.PolyLine(
-        locations=[
-            [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-            [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-        ],
-        color="#bbb", weight=2, opacity=0.5
-    ).add_to(m)
-
-    # Render + capture clicks (per streamlit-folium docs, use 'last_clicked')  [5](https://folium.streamlit.app/)
-    map_data = st_folium(m, height=540, width=820, key="uber_map_nyc", returned_objects=[])
-
-    # --- Robust click handler: move the nearest marker to the clicked point ---
-    click = (map_data or {}).get("last_clicked")
-    if click:
-        try:
-            click_lat = float(click.get("lat"))
-            click_lng = float(click.get("lng"))
-        except (TypeError, ValueError):
-            click_lat = click_lng = None
-
-        if click_lat is not None and click_lng is not None:
-            last = st.session_state.last_click
-            # Only react if the click changed
-            if last is None or (abs(last[0] - click_lat) > 1e-10 or abs(last[1] - click_lng) > 1e-10):
-                st.session_state.last_click = (click_lat, click_lng)
-                # Move the NEAREST marker (intuitive, no mode buttons)
-                d_pick = math.hypot(click_lat - st.session_state.pickup["lat"], click_lng - st.session_state.pickup["lng"])
-                d_drop = math.hypot(click_lat - st.session_state.dropoff["lat"], click_lng - st.session_state.dropoff["lng"])
-                if d_pick <= d_drop:
-                    st.session_state.pickup = {"lat": click_lat, "lng": click_lng}
-                    st.session_state.pickup_address = f"{click_lat:.6f}, {click_lng:.6f}"
-                else:
-                    st.session_state.dropoff = {"lat": click_lat, "lng": click_lng}
-                    st.session_state.dropoff_address = f"{click_lat:.6f}, {click_lng:.6f}"
-                st.rerun()
-
-# =========================
-# HELPERS & OSRM
-# =========================
-@st.cache_data(show_spinner=False, ttl=300)
-def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
-    """
-    Call OSRM /route and return: distance_km, duration_min, path_latlon.
-
-    OSRM expects {lon},{lat} in URL; we request geometries=geojson + overview=full
-    and convert [lon,lat] -> [lat,lon] for Folium.  (docs)  [3](http://project-osrm.org/docs/v5.5.1/api/)[4](https://github.com/Project-OSRM/osrm-backend/blob/master/include/engine/api/route_parameters.hpp)
-    """
-    coords = f"{p_lng},{p_lat};{d_lng},{d_lat}"
-    url = f"{server}/route/v1/{profile}/{coords}"
-    params = {"geometries": "geojson", "overview": "full"}
-    headers = {"User-Agent": "streamlit-uber-osrm-demo"}
-    resp = requests.get(url, params=params, headers=headers, timeout=20)
-
-    if resp.status_code == 429:
-        raise RuntimeError("OSRM rate limit (429). Please slow down or cache more.")
-    resp.raise_for_status()
-
-    data = resp.json()
-    if data.get("code") != "Ok" or not data.get("routes"):
-        raise RuntimeError(f"Invalid OSRM response: {data}")
-
-    route = data["routes"][0]
-    dist_km = float(route["distance"]) / 1000.0
-    dur_min = float(route["duration"]) / 60.0
-
-    coords_lonlat = route["geometry"]["coordinates"]          # [lon, lat]
-    coords_latlon = [[c[1], c[0]] for c in coords_lonlat]     # swap -> [lat, lon]
-    return dist_km, dur_min, coords_latlon
-
-def local_fare_estimate(distance_km, passengers=1):
-    base = 3.0
-    per_km = 1.8
-    pax_fee = max(0, passengers-1) * 0.5
-    return round(base + per_km*max(distance_km, 0) + pax_fee, 2)
-
-def make_payload(pickup, dropoff, date, t, passengers):
-    dt_local = datetime.combine(date, t)
-    return {
-        "pickup_datetime": dt_local.strftime("%Y-%m-%d %H:%M:%S"),
-        "pickup_longitude": float(pickup["lng"]),
-        "pickup_latitude": float(pickup["lat"]),
-        "dropoff_longitude": float(dropoff["lng"]),
-        "dropoff_latitude": float(dropoff["lat"]),
-        "passenger_count": int(passengers),
-    }
-
-def call_fare_api(url, params):
-    headers = {"Accept": "application/json"}
-    resp = requests.get(url, params=params, headers=headers, timeout=20)
-    if resp.status_code == 429:
-        raise RuntimeError("Fare API returned 429 (Too Many Requests). Try later.")
-    resp.raise_for_status()
-    return resp.json()
-
-# =========================
-# PREDICTION / DISPLAY
-# =========================
-if predict_now:
-    errs = []
-    for name, pt in [("Pickup", st.session_state.pickup), ("Dropoff", st.session_state.dropoff)]:
-        if not (-90 <= pt["lat"] <= 90 and -180 <= pt["lng"] <= 180):
-            errs.append(f"{name}: coordinates out of bounds.")
-    if passenger_count < 1:
-        errs.append("Passengers must be ≥ 1.")
-
-    if errs:
-        for e in errs:
-            st.error(e)
-    else:
-        # OSRM route
-        with st.spinner("Routing via OSRM…"):
-            try:
-                dist_km, dur_min, path_latlon = call_osrm_route(
-                    OSRM_SERVER, PROFILE,
-                    st.session_state.pickup["lat"], st.session_state.pickup["lng"],
-                    st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]
-                )
-            except Exception as e:
-                st.error(f"OSRM error: {e}")
-                dist_km = math.dist(
-                    (st.session_state.pickup["lat"], st.session_state.pickup["lng"]),
-                    (st.session_state.dropoff["lat"], st.session_state.dropoff["lng"])
-                ) * 111
-                dur_min = dist_km / (22/60)
-                path_latlon = [
-                    [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-                    [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-                ]
-
-        # Metrics
-        local_est = local_fare_estimate(dist_km, passengers=passenger_count)
-        st.markdown("### 📊 Trip details")
-        c_m1, c_m2, c_m3 = st.columns(3)
-        c_m1.metric("Distance (OSRM)", f"{dist_km:.2f} km")
-        c_m2.metric("Duration (OSRM)", f"{int(dur_min)} min")
-        c_m3.metric("Local estimate", f"${local_est:.2f}")
-
-        # Route map
-        m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB positron")
-        folium.Marker(
-            [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-            popup=f"Pickup:<br>{st.session_state.pickup_address}",
-            icon=folium.Icon(color="green", icon="play")
-        ).add_to(m2)
-        folium.Marker(
-            [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-            popup=f"Dropoff:<br>{st.session_state.dropoff_address}",
-            icon=folium.Icon(color="red", icon="flag")
-        ).add_to(m2)
-        folium.PolyLine(
-            locations=path_latlon,
-            color="#2A9D8F", weight=6, opacity=0.95
-        ).add_to(m2)
-        try:
-            m2.fit_bounds(path_latlon)
-        except Exception:
-            pass
-        st_folium(m2, height=540, width=820, key="uber_map_osrm_result", returned_objects=[])
-
-        # Fare API
-        with st.spinner("Calling fare API…"):
-            try:
-                payload = make_payload(st.session_state.pickup, st.session_state.dropoff, trip_date, trip_time, passenger_count)
-                result = call_fare_api(fare_api_url, payload)
-                fare = result.get("fare") or result.get("prediction") or result.get("y_pred")
-                if fare is not None:
-                    st.success("Prediction received (API)")
-                    st.metric("💵 Estimated fare (API)", f"${float(fare):.2f}")
-                else:
-                    st.warning("API returned JSON but no 'fare' key — showing local estimate.")
-                with st.expander("📦 Request details"):
-                    st.json({"endpoint": fare_api_url, "params": payload})
-                with st.expander("📬 Raw API response"):
-                    st.json(result)
-            except Exception as e:
-                st.error(f"Fare API error: {e}")
-                st.info(f"Local fallback fare: **${local_est:.2f}**")
