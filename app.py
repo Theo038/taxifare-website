@@ -12,11 +12,10 @@ from streamlit_folium import st_folium
 # =========================
 st.set_page_config(page_title="NY Taxi App", page_icon="🚕", layout="wide")
 
-# Hide Streamlit toolbar / "Manage app" badge / footer decorations
+# Hide Streamlit toolbar / badge / footer
 st.markdown(
     """
     <style>
-    /* Hide the Streamlit main toolbar (top-right) and bottom decoration/badge */
     div[data-testid="stToolbar"] { visibility: hidden; height: 0px; }
     div[data-testid="stDecoration"] { visibility: hidden; height: 0px; }
     div[data-testid="stStatusWidget"] { visibility: hidden; height: 0px; }
@@ -29,22 +28,22 @@ st.markdown(
 
 st.markdown('<h2>🚕 NY Taxi App Routing</h2>', unsafe_allow_html=True)
 st.markdown(
-    '<div>Type coordinates or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>',
+    '<div>Type address or click the map. The <b>nearest marker</b> (pickup/dropoff) moves to your click.</div>',
     unsafe_allow_html=True,
 )
 st.markdown("<hr>", unsafe_allow_html=True)
 
 # =========================
-# CONSTANTS (fixed OSRM profile & endpoints)
+# CONSTANTS (OSRM & Fare API)
 # =========================
-OSRM_SERVER = "https://router.project-osrm.org"   # demo server (testing)
-PROFILE = "driving"                               # always driving
+OSRM_SERVER = "https://router.project-osrm.org"          # demo server
+PROFILE = "driving"                                      # fixed
 DEFAULT_FARE_API = "https://taxifare.lewagon.ai/predict"
 
 with st.sidebar:
     st.markdown("### ⚙️ Configuration")
     fare_api_url = st.text_input("Fare prediction endpoint (GET)", value=DEFAULT_FARE_API)
-    st.info("OSRM demo server is rate-limited (429 possible) and provides no SLA. Avoid spamming.")
+    st.info("OSRM demo server is rate-limited (429 possible). Avoid spamming.")
 
 # =========================
 # SESSION STATE
@@ -52,20 +51,56 @@ with st.sidebar:
 def init_state():
     # NYC defaults
     if "pickup" not in st.session_state:
-        # Times Square
-        st.session_state.pickup = {"lat": 40.7580, "lng": -73.9855}
+        st.session_state.pickup = {"lat": 40.7580, "lng": -73.9855}   # Times Square
     if "dropoff" not in st.session_state:
-        # Central Park South
-        st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}
+        st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}  # Central Park South
     if "last_click" not in st.session_state:
         st.session_state.last_click = None
+    if "pickup_address" not in st.session_state:
+        st.session_state.pickup_address = "Times Square, New York, NY"
+    if "dropoff_address" not in st.session_state:
+        st.session_state.dropoff_address = "Central Park South, New York, NY"
 
 init_state()
 
 # =========================
+# GEOCODING (Nominatim)
+# =========================
+@st.cache_data(ttl=600, show_spinner=False)
+def geocode_address(q: str, countrycodes="us"):
+    """
+    Geocode using Nominatim Search API (jsonv2).
+    Respect usage policy: provide User-Agent, keep <=1 req/s, cache results.  (docs)  [1](https://nominatim.org/release-docs/latest/api/Search/)[2](https://operations.osmfoundation.org/policies/nominatim/)
+    """
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": countrycodes,
+    }
+    headers = {
+        # Identify your app per policy; put a contact email/URL if you deploy publicly.
+        "User-Agent": "ny-taxi-app/1.0 (contact: user@example.com)"
+    }
+    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    if resp.status_code == 429:
+        raise RuntimeError("Nominatim rate limit (429). Please slow down.")
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    item = data[0]
+    return {
+        "lat": float(item["lat"]),
+        "lng": float(item["lon"]),
+        "display_name": item.get("display_name", q),
+    }
+
+# =========================
 # UI CONTROLS
 # =========================
-left, right = st.columns([0.38, 0.62])
+left, right = st.columns([0.42, 0.58])
 
 with left:
     st.markdown("### 🎛️ Trip parameters")
@@ -73,22 +108,47 @@ with left:
     trip_date = c_dt1.date_input("Date", value=datetime.now().date())
     trip_time = c_dt2.time_input("Time", value=time(12, 0))
 
-    st.markdown("#### 📍 Pickup")
-    p1, p2 = st.columns(2)
-    pickup_lat = p1.number_input("Pickup latitude", value=float(st.session_state.pickup["lat"]), format="%.6f")
-    pickup_lng = p2.number_input("Pickup longitude", value=float(st.session_state.pickup["lng"]), format="%.6f")
-    if st.button("🔄 Update map from pickup"):
-        st.session_state.pickup = {"lat": float(pickup_lat), "lng": float(pickup_lng)}
-        st.rerun()
+    # --- Address inputs + Geocode buttons ---
+    st.markdown("#### 📍 Pickup address")
+    col_pa1, col_pa2 = st.columns([3, 1])
+    st.session_state.pickup_address = col_pa1.text_input(
+        "Enter pickup address",
+        value=st.session_state.pickup_address,
+        placeholder="e.g., 1600 Broadway, New York, NY",
+    )
+    if col_pa2.button("🔎 Geocode pickup"):
+        try:
+            res = geocode_address(st.session_state.pickup_address)
+            if res is None:
+                st.warning("No result for pickup address.")
+            else:
+                st.session_state.pickup = {"lat": res["lat"], "lng": res["lng"]}
+                # overwrite normalized display name
+                st.session_state.pickup_address = res["display_name"]
+                st.rerun()
+        except Exception as e:
+            st.error(f"Pickup geocoding failed: {e}")
 
-    st.markdown("#### 🏁 Dropoff")
-    d1, d2 = st.columns(2)
-    dropoff_lat = d1.number_input("Dropoff latitude", value=float(st.session_state.dropoff["lat"]), format="%.6f")
-    dropoff_lng = d2.number_input("Dropoff longitude", value=float(st.session_state.dropoff["lng"]), format="%.6f")
-    if st.button("🔄 Update map from dropoff"):
-        st.session_state.dropoff = {"lat": float(dropoff_lat), "lng": float(dropoff_lng)}
-        st.rerun()
+    st.markdown("#### 🏁 Dropoff address")
+    col_da1, col_da2 = st.columns([3, 1])
+    st.session_state.dropoff_address = col_da1.text_input(
+        "Enter dropoff address",
+        value=st.session_state.dropoff_address,
+        placeholder="e.g., 10 Columbus Cir, New York, NY",
+    )
+    if col_da2.button("🔎 Geocode dropoff"):
+        try:
+            res = geocode_address(st.session_state.dropoff_address)
+            if res is None:
+                st.warning("No result for dropoff address.")
+            else:
+                st.session_state.dropoff = {"lat": res["lat"], "lng": res["lng"]}
+                st.session_state.dropoff_address = res["display_name"]
+                st.rerun()
+        except Exception as e:
+            st.error(f"Dropoff geocoding failed: {e}")
 
+    # Passengers
     passenger_count = st.slider("👥 Passengers", min_value=1, max_value=6, value=1)
 
     st.markdown("<hr>", unsafe_allow_html=True)
@@ -100,6 +160,8 @@ with left:
     if reset:
         st.session_state.pickup = {"lat": 40.7580, "lng": -73.9855}
         st.session_state.dropoff = {"lat": 40.7676, "lng": -73.9817}
+        st.session_state.pickup_address = "Times Square, New York, NY"
+        st.session_state.dropoff_address = "Central Park South, New York, NY"
         st.session_state.last_click = None
         st.rerun()
 
@@ -108,22 +170,22 @@ with right:
     center_lat = (st.session_state.pickup["lat"] + st.session_state.dropoff["lat"]) / 2
     center_lng = (st.session_state.pickup["lng"] + st.session_state.dropoff["lng"]) / 2
 
-    # Pretty light basemap (reliable alias; no attribution error)
+    # Light basemap (reliable alias)
     m = folium.Map(location=[center_lat, center_lng], zoom_start=13, tiles="CartoDB positron")
 
-    # Markers
+    # Markers with address popups
     folium.Marker(
         [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-        popup="Pickup",
+        popup=f"Pickup:<br>{st.session_state.pickup_address}",
         icon=folium.Icon(color="green", icon="play")
     ).add_to(m)
     folium.Marker(
         [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-        popup="Dropoff",
+        popup=f"Dropoff:<br>{st.session_state.dropoff_address}",
         icon=folium.Icon(color="red", icon="flag")
     ).add_to(m)
 
-    # Light straight line (placeholder before OSRM route)
+    # Straight line before OSRM route
     folium.PolyLine(
         locations=[
             [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
@@ -132,12 +194,8 @@ with right:
         color="#bbb", weight=2, opacity=0.5
     ).add_to(m)
 
-    # Render + capture clicks (defensive access to the click structure)
-    map_data = st_folium(
-        m, height=540, width=820,
-        key="uber_map_nyc",
-        returned_objects=[]
-    )
+    # Render + capture clicks (per streamlit-folium docs, use 'last_clicked')  [5](https://folium.streamlit.app/)
+    map_data = st_folium(m, height=540, width=820, key="uber_map_nyc", returned_objects=[])
 
     # --- Robust click handler: move the nearest marker to the clicked point ---
     click = (map_data or {}).get("last_clicked")
@@ -158,8 +216,10 @@ with right:
                 d_drop = math.hypot(click_lat - st.session_state.dropoff["lat"], click_lng - st.session_state.dropoff["lng"])
                 if d_pick <= d_drop:
                     st.session_state.pickup = {"lat": click_lat, "lng": click_lng}
+                    st.session_state.pickup_address = f"{click_lat:.6f}, {click_lng:.6f}"
                 else:
                     st.session_state.dropoff = {"lat": click_lat, "lng": click_lng}
+                    st.session_state.dropoff_address = f"{click_lat:.6f}, {click_lng:.6f}"
                 st.rerun()
 
 # =========================
@@ -168,11 +228,10 @@ with right:
 @st.cache_data(show_spinner=False, ttl=300)
 def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     """
-    Call OSRM /route and return: distance_km, duration_min, path_latlon
+    Call OSRM /route and return: distance_km, duration_min, path_latlon.
 
-    OSRM expects coordinates {lon},{lat} in the URL.
-    Request geometries=geojson (easier than decoding polyline).
-    OSRM returns GeoJSON coordinates in [lon,lat]; swap to [lat,lon] for Folium/Leaflet.
+    OSRM expects {lon},{lat} in URL; we request geometries=geojson + overview=full
+    and convert [lon,lat] -> [lat,lon] for Folium.  (docs)  [3](http://project-osrm.org/docs/v5.5.1/api/)[4](https://github.com/Project-OSRM/osrm-backend/blob/master/include/engine/api/route_parameters.hpp)
     """
     coords = f"{p_lng},{p_lat};{d_lng},{d_lat}"
     url = f"{server}/route/v1/{profile}/{coords}"
@@ -197,7 +256,6 @@ def call_osrm_route(server, profile, p_lat, p_lng, d_lat, d_lng):
     return dist_km, dur_min, coords_latlon
 
 def local_fare_estimate(distance_km, passengers=1):
-    """Simple fallback fare: base + per km + small add-on per extra passenger."""
     base = 3.0
     per_km = 1.8
     pax_fee = max(0, passengers-1) * 0.5
@@ -226,7 +284,6 @@ def call_fare_api(url, params):
 # PREDICTION / DISPLAY
 # =========================
 if predict_now:
-    # validations
     errs = []
     for name, pt in [("Pickup", st.session_state.pickup), ("Dropoff", st.session_state.dropoff)]:
         if not (-90 <= pt["lat"] <= 90 and -180 <= pt["lng"] <= 180):
@@ -235,7 +292,8 @@ if predict_now:
         errs.append("Passengers must be ≥ 1.")
 
     if errs:
-        for e in errs: st.error(e)
+        for e in errs:
+            st.error(e)
     else:
         # OSRM route
         with st.spinner("Routing via OSRM…"):
@@ -247,12 +305,11 @@ if predict_now:
                 )
             except Exception as e:
                 st.error(f"OSRM error: {e}")
-                # Fallback straight-line approx if OSRM fails
                 dist_km = math.dist(
                     (st.session_state.pickup["lat"], st.session_state.pickup["lng"]),
                     (st.session_state.dropoff["lat"], st.session_state.dropoff["lng"])
-                ) * 111  # rough lat/lon -> km
-                dur_min = dist_km / (22/60)  # ~22 km/h
+                ) * 111
+                dur_min = dist_km / (22/60)
                 path_latlon = [
                     [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
                     [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
@@ -270,12 +327,12 @@ if predict_now:
         m2 = folium.Map(location=path_latlon[0], zoom_start=13, tiles="CartoDB positron")
         folium.Marker(
             [st.session_state.pickup["lat"], st.session_state.pickup["lng"]],
-            popup="Pickup",
+            popup=f"Pickup:<br>{st.session_state.pickup_address}",
             icon=folium.Icon(color="green", icon="play")
         ).add_to(m2)
         folium.Marker(
             [st.session_state.dropoff["lat"], st.session_state.dropoff["lng"]],
-            popup="Dropoff",
+            popup=f"Dropoff:<br>{st.session_state.dropoff_address}",
             icon=folium.Icon(color="red", icon="flag")
         ).add_to(m2)
         folium.PolyLine(
@@ -306,5 +363,3 @@ if predict_now:
             except Exception as e:
                 st.error(f"Fare API error: {e}")
                 st.info(f"Local fallback fare: **${local_est:.2f}**")
-
-st.caption("Built with Streamlit • Folium • streamlit-folium • Requests • OSRM — Real route, distance & duration.")
