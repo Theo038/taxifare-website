@@ -149,6 +149,9 @@ def autocomplete_locationiq(q: str, limit=6, countrycodes="us", viewbox=NYC_VIEW
         "bounded": bounded,
         "accept-language": "en"
     }
+
+
+    
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
@@ -442,4 +445,3 @@ if predict_now:
             except Exception as e:
                 st.error(f"Fare API error: {e}")
                 st.info(f"Local fallback fare: **${local_est:.2f}**")
-
