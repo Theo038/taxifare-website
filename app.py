@@ -194,6 +194,8 @@ def get_suggestions(q: str, is_pickup: bool):
 # =========================
 left, right = st.columns([0.48, 0.52])
 
+
+
 with left:
     st.markdown("### 🎛️ Trip parameters")
     c_dt1, c_dt2 = st.columns(2)
@@ -442,4 +444,3 @@ if predict_now:
             except Exception as e:
                 st.error(f"Fare API error: {e}")
                 st.info(f"Local fallback fare: **${local_est:.2f}**")
-
